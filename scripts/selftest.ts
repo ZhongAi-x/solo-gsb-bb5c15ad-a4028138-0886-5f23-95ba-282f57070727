@@ -8,6 +8,13 @@ import {
   points2Label,
 } from '../src/engine';
 import { normalizeState } from '../src/storage';
+import {
+  SNAPSHOT_KIND,
+  SNAPSHOT_SCHEMA_VERSION,
+  buildSnapshotJson,
+  parseSnapshot,
+  snapshotFileName,
+} from '../src/snapshot';
 
 let uid = 0;
 const mkPlayers = (
@@ -463,3 +470,326 @@ console.log('\n全部引擎自测通过 ✅');
 }
 
 console.log('缺席能力自测通过 ✅');
+
+// ===== 赛事快照导入/导出 =====
+
+/** 构造一份包含选手、队伍、轮次、缺席快照、赛果与轮空的完整状态 */
+const buildSampleState = (): TournamentState => {
+  const ps = mkPlayers(['甲', '乙', '丙', '丁', '戊'], {
+    甲: '红队', 乙: '红队', 丙: '蓝队',
+  });
+  const [a, b, c, d, e] = ps;
+  const r1 = round([match(a.id, d.id), match(b.id, c.id, 'draw'), match(e.id, null)]);
+  r1.absentIds = [];
+  const pending = (x: string, y: string): Round['matches'][number] => ({
+    id: `m${++mid}`,
+    playerAId: x,
+    playerBId: y,
+    resultA: null,
+    bye: false,
+  });
+  const r2 = round([pending(a.id, c.id), pending(b.id, d.id)]);
+  r2.absentIds = [e.id];
+  return { players: ps, rounds: [r1, r2] };
+};
+
+const expectErrorsAt = (text: string, fragments: string[]) => {
+  const r = parseSnapshot(text);
+  assert.ok(!r.ok, '应当校验失败');
+  if (!r.ok) {
+    for (const frag of fragments) {
+      assert.ok(
+        r.errors.some((e) => e.path === frag || e.path.startsWith(frag)),
+        `缺少路径包含「${frag}」的错误；实际：${r.errors.map((e) => e.path).join(', ')}`,
+      );
+    }
+    return r.errors;
+  }
+  return [];
+};
+
+// 14. 导出 → 导入往返：结构与赛果、缺席快照完整保留
+{
+  const state = buildSampleState();
+  const json = buildSnapshotJson(state);
+  const parsed = JSON.parse(json);
+  assert.strictEqual(parsed.schemaVersion, SNAPSHOT_SCHEMA_VERSION);
+  assert.strictEqual(parsed.kind, SNAPSHOT_KIND);
+  const r = parseSnapshot(json);
+  assert.ok(r.ok, `往返导入应成功：${!r.ok ? r.errors.map((e) => `${e.path} ${e.message}`).join('；') : ''}`);
+  if (r.ok) {
+    // 导出会省略 team: undefined 键；语义比较时同样剥除该键
+    const expected: TournamentState = {
+      ...state,
+      players: state.players.map(({ team, ...rest }) => (team ? { ...rest, team } : rest)),
+    };
+    assert.deepStrictEqual(r.state, expected, '往返后状态必须与导出前一致');
+    assert.strictEqual(r.summary.playerCount, 5);
+    assert.strictEqual(r.summary.teamCount, 2);
+    assert.strictEqual(r.summary.roundCount, 2);
+    assert.strictEqual(r.summary.matchCount, 5);
+    assert.strictEqual(r.summary.byeCount, 1);
+    assert.strictEqual(r.summary.pendingResultCount, 2);
+  }
+  // 文件名带时间戳，形如 swiss-tournament-20260920-010203.json
+  assert.match(snapshotFileName(new Date(2026, 8, 20, 1, 2, 3)), /^swiss-tournament-\d{8}-\d{6}\.json$/);
+  console.log('✓ 快照：导出/导入往返一致');
+}
+
+// 15. 旧版迁移：缺少 schemaVersion 与 absentIds 不阻塞，缺席名单迁移为空
+{
+  const legacy = {
+    players: [{ id: 'p1', name: '甲' }],
+    rounds: [{ id: 'r1', matches: [{ id: 'm1', playerAId: 'p1', playerBId: null, resultA: 'win' }] }],
+  };
+  const r = parseSnapshot(JSON.stringify(legacy));
+  assert.ok(r.ok, !r.ok ? r.errors.map((e) => e.message).join('；') : '');
+  if (r.ok) {
+    assert.deepStrictEqual(r.state.rounds[0].absentIds, [], '旧轮次 absentIds 迁移为空数组');
+    assert.ok(r.warnings.migrations.some((m) => m.includes('schemaVersion')));
+    assert.ok(r.warnings.migrations.some((m) => m.includes('absentIds')));
+  }
+  console.log('✓ 快照：旧版缺少 absentIds 迁移为空数组');
+}
+
+// 16. ID 唯一：选手/轮次/对局 id 重复均按 JSON 路径报错
+{
+  const dup = {
+    schemaVersion: 1,
+    players: [
+      { id: 'p1', name: '甲' },
+      { id: 'p1', name: '乙' },
+    ],
+    rounds: [
+      { id: 'r1', absentIds: [], matches: [{ id: 'x', playerAId: 'p1', playerBId: 'p1', resultA: null }] },
+      { id: 'r1', absentIds: [], matches: [{ id: 'x', playerAId: 'p1', playerBId: null, resultA: 'win', bye: true }] },
+    ],
+  };
+  const r = parseSnapshot(JSON.stringify(dup));
+  assert.ok(!r.ok);
+  if (!r.ok) {
+    const paths = r.errors.map((e) => e.path);
+    assert.ok(paths.includes('$.players[1].id'), '重复选手 id 需定位');
+    assert.ok(paths.includes('$.rounds[1].id'), '重复轮次 id 需定位');
+    assert.ok(paths.includes('$.rounds[1].matches[0].id'), '重复对局 id 需定位');
+  }
+  console.log('✓ 快照：ID 唯一性按路径报错');
+}
+
+// 17. 对局引用不存在的选手：playerAId / playerBId 各自定位
+{
+  const bad = {
+    schemaVersion: 1,
+    players: [{ id: 'p1', name: '甲' }],
+    rounds: [
+      {
+        id: 'r1',
+        absentIds: [],
+        matches: [
+          { id: 'm1', playerAId: 'p1', playerBId: 'ghost', resultA: null },
+          { id: 'm2', playerAId: 'ghost2', playerBId: 'p1', resultA: 'win' },
+        ],
+      },
+    ],
+  };
+  expectErrorsAt(JSON.stringify(bad), ['$.rounds[0].matches[0].playerBId', '$.rounds[0].matches[1].playerAId']);
+  console.log('✓ 快照：对局引用存在性校验');
+}
+
+// 18. 同轮选手不重复
+{
+  const bad = {
+    schemaVersion: 1,
+    players: [
+      { id: 'p1', name: '甲' },
+      { id: 'p2', name: '乙' },
+      { id: 'p3', name: '丙' },
+    ],
+    rounds: [
+      {
+        id: 'r1',
+        absentIds: [],
+        matches: [
+          { id: 'm1', playerAId: 'p1', playerBId: 'p2', resultA: null },
+          { id: 'm2', playerAId: 'p2', playerBId: 'p3', resultA: null },
+        ],
+      },
+    ],
+  };
+  const errs = expectErrorsAt(JSON.stringify(bad), ['$.rounds[0].matches[1].playerAId']);
+  assert.ok(errs.some((e) => e.message.includes('重复出现')));
+  console.log('✓ 快照：同轮选手不重复');
+}
+
+// 19. 轮空结构合法：playerBId 为 null 必须 bye=true，反之亦然
+{
+  const bad = {
+    schemaVersion: 1,
+    players: [{ id: 'p1', name: '甲' }],
+    rounds: [
+      {
+        id: 'r1',
+        absentIds: [],
+        matches: [
+          { id: 'm1', playerAId: 'p1', playerBId: null, resultA: 'win', bye: false },
+        ],
+      },
+    ],
+  };
+  expectErrorsAt(JSON.stringify(bad), ['$.rounds[0].matches[0].bye']);
+
+  // 旧数据未写 bye：按结构推断，合法
+  const legacy = {
+    schemaVersion: 1,
+    players: [{ id: 'p1', name: '甲' }],
+    rounds: [
+      { id: 'r1', absentIds: [], matches: [{ id: 'm1', playerAId: 'p1', playerBId: null, resultA: 'win' }] },
+    ],
+  };
+  const r = parseSnapshot(JSON.stringify(legacy));
+  assert.ok(r.ok, !r.ok ? r.errors.map((e) => e.message).join('；') : '');
+  if (r.ok) assert.strictEqual(r.state.rounds[0].matches[0].bye, true);
+  console.log('✓ 快照：轮空结构校验与旧格式推断');
+}
+
+// 20. 赛果取值有效：非法枚举与轮空非 win 均报错
+{
+  const bad = {
+    schemaVersion: 1,
+    players: [
+      { id: 'p1', name: '甲' },
+      { id: 'p2', name: '乙' },
+    ],
+    rounds: [
+      {
+        id: 'r1',
+        absentIds: [],
+        matches: [
+          { id: 'm1', playerAId: 'p1', playerBId: 'p2', resultA: 'WIN' },
+          { id: 'm2', playerAId: 'p2', playerBId: null, resultA: 'draw', bye: true },
+        ],
+      },
+    ],
+  };
+  const errs = expectErrorsAt(JSON.stringify(bad), ['$.rounds[0].matches[0].resultA', '$.rounds[0].matches[1].resultA']);
+  assert.ok(errs.some((e) => e.message.includes('赛果取值无效')));
+  assert.ok(errs.some((e) => e.message.includes('轮空')));
+  console.log('✓ 快照：赛果取值有效');
+}
+
+// 21. 禁止部分导入：多个错误一次性全部收集，且不产出 state
+{
+  const bad = {
+    schemaVersion: 1,
+    players: [{ id: 'p1', name: '' }],
+    rounds: 'nope',
+  };
+  const r = parseSnapshot(JSON.stringify(bad));
+  assert.ok(!r.ok);
+  if (!r.ok) {
+    assert.ok(r.errors.length >= 2, '应一次性收集所有错误');
+    assert.ok(r.errors.some((e) => e.path === '$.players[0].name'));
+    assert.ok(r.errors.some((e) => e.path === '$.rounds'));
+  }
+  console.log('✓ 快照：错误全量收集且禁止部分导入');
+}
+
+// 22. 顶层结构错误：非法 JSON / 非对象 / 版本过高
+{
+  const r1 = parseSnapshot('{ not json');
+  assert.ok(!r1.ok && r1.errors[0].path === '$');
+  const r2 = parseSnapshot('[1,2,3]');
+  assert.ok(!r2.ok && r2.errors.some((e) => e.path === '$'));
+  const r3 = parseSnapshot(JSON.stringify({ schemaVersion: 999, players: [], rounds: [] }));
+  assert.ok(!r3.ok && r3.errors.some((e) => e.path === '$.schemaVersion'));
+  console.log('✓ 快照：非法 JSON、非对象与版本拦截');
+}
+
+// 23. 规范化：剔除未知字段、队伍名 trim、缺席快照引用缺失选手被忽略（警告）
+{
+  const raw = {
+    schemaVersion: 1,
+    players: [
+      { id: 'p1', name: ' 甲 ', team: ' 红队 ', unknown: 42 },
+      { id: 'p2', name: '乙', team: '   ' },
+      { id: 'p3', name: '丙' },
+    ],
+    rounds: [
+      {
+        id: 'r1',
+        absentIds: ['p3', 'ghost', 'p3'],
+        matches: [
+          { id: 'm1', playerAId: 'p1', playerBId: 'p2', resultA: null, whiteId: 'x' },
+        ],
+      },
+    ],
+  };
+  const r = parseSnapshot(JSON.stringify(raw));
+  assert.ok(r.ok, !r.ok ? r.errors.map((e) => e.message).join('；') : '');
+  if (r.ok) {
+    assert.strictEqual(r.state.players[0].name, '甲');
+    assert.strictEqual(r.state.players[0].team, '红队');
+    assert.strictEqual(r.state.players[1].team, undefined);
+    assert.deepStrictEqual(r.state.rounds[0].absentIds, ['p3'], '无效/重复缺席条目被清理');
+    assert.strictEqual('unknown' in r.state.players[0], false);
+    assert.strictEqual('whiteId' in r.state.rounds[0].matches[0], false);
+    assert.ok(r.warnings.issues.some((i) => i.path.includes('absentIds')));
+  }
+  console.log('✓ 快照：规范化与非阻塞问题预览');
+}
+
+// 24. 超过 32 人上限拒绝导入；同名选手仅警告
+{
+  const raw = {
+    schemaVersion: 1,
+    players: Array.from({ length: 33 }, (_, i) => ({ id: `p${i}`, name: i === 1 ? '甲' : `P${i}` })),
+    rounds: [{ id: 'r0', absentIds: [], matches: [] }],
+  };
+  raw.players[1].id = 'p1b';
+  raw.players[0].name = '甲';
+  const r = parseSnapshot(JSON.stringify(raw));
+  assert.ok(!r.ok, '33 人必须拒绝');
+  if (!r.ok) assert.ok(r.errors.some((e) => e.path === '$.players'));
+
+  const dupName = {
+    schemaVersion: 1,
+    players: [
+      { id: 'a', name: '同名' },
+      { id: 'b', name: '同名' },
+    ],
+    rounds: [],
+  };
+  const r2 = parseSnapshot(JSON.stringify(dupName));
+  assert.ok(r2.ok);
+  if (r2.ok) assert.ok(r2.warnings.issues.some((i) => i.message.includes('同名')));
+  console.log('✓ 快照：人数上限与同名警告');
+}
+
+// 25. 缺席名单与同轮对局冲突、同一对局双方为同一人
+{
+  const bad = {
+    schemaVersion: 1,
+    players: [
+      { id: 'p1', name: '甲' },
+      { id: 'p2', name: '乙' },
+    ],
+    rounds: [
+      {
+        id: 'r1',
+        absentIds: ['p2'],
+        matches: [{ id: 'm1', playerAId: 'p1', playerBId: 'p2', resultA: null }],
+      },
+      {
+        id: 'r2',
+        absentIds: [],
+        matches: [{ id: 'm2', playerAId: 'p1', playerBId: 'p1', resultA: null }],
+      },
+    ],
+  };
+  const errs = expectErrorsAt(JSON.stringify(bad), ['$.rounds[0].matches[0].playerBId', '$.rounds[1].matches[0].playerBId']);
+  assert.ok(errs.some((e) => e.message.includes('缺席名单')));
+  assert.ok(errs.some((e) => e.message.includes('同一名选手')));
+  console.log('✓ 快照：缺席/对局一致性校验');
+}
+
+console.log('快照导入导出自测通过 ✅');

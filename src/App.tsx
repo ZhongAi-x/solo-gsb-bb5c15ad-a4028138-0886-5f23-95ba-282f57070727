@@ -1,12 +1,14 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { DraftPair, Match, TournamentState } from './types';
 import { computeStandings, type PairingPlan } from './engine';
 import { clearState, loadState, saveState } from './storage';
+import { buildSnapshotJson, parseSnapshot, snapshotFileName, type SnapshotParseResult } from './snapshot';
 import { uid } from './uid';
 import { PlayersPanel } from './PlayersPanel';
 import { StandingsTable } from './StandingsTable';
 import { RoundsPanel } from './RoundsPanel';
 import { NextRoundPanel } from './NextRoundPanel';
+import { ImportSnapshotDialog } from './ImportSnapshotDialog';
 
 const DEMO_NAMES = ['阿尔法', '贝塔', '伽马', '德尔塔', '艾普西龙', '迪纳摩'];
 
@@ -17,6 +19,9 @@ export default function App() {
   const [manual, setManual] = useState<DraftPair[]>([]);
   // 下一轮工作区中勾选的本轮缺席选手（确认轮次时快照写入 Round.absentIds）
   const [absentIds, setAbsentIds] = useState<string[]>([]);
+  // 快照导入：选择文件后的解析结果（未确认前不改动 state）
+  const [importData, setImportData] = useState<{ fileName: string; result: SnapshotParseResult } | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     saveState(state);
@@ -106,6 +111,40 @@ export default function App() {
     setAbsentIds([]);
   };
 
+  /** 导出赛事快照：带 schemaVersion 的 JSON 文件（选手/队伍/轮次/缺席快照/赛果） */
+  const exportSnapshot = () => {
+    const blob = new Blob([buildSnapshotJson(state)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = snapshotFileName();
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  /** 选择快照文件后，先在内存完成解析与全量校验（不触碰当前赛事） */
+  const onSnapshotFileChosen = (file: File) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const text = typeof reader.result === 'string' ? reader.result : '';
+      setImportData({ fileName: file.name, result: parseSnapshot(text) });
+    };
+    reader.onerror = () => {
+      window.alert(`读取文件失败：${file.name}`);
+    };
+    reader.readAsText(file);
+  };
+
+  /** 二次确认后一次性替换赛事；下一轮临时锁定与缺席勾选同步清空 */
+  const confirmImport = (next: TournamentState) => {
+    setState(next);
+    setManual([]);
+    setAbsentIds([]);
+    setImportData(null);
+  };
+
   const resetAll = () => {
     if (!window.confirm('将清空全部选手、轮次与赛果，且不可恢复，确定继续？')) return;
     clearState();
@@ -150,9 +189,37 @@ export default function App() {
           </p>
         </div>
         <div className="top-actions">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="application/json,.json"
+            className="hidden-file-input"
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file) onSnapshotFileChosen(file);
+              // 允许再次选择同一文件
+              e.target.value = '';
+            }}
+          />
           {(state.players.length === 0) && (
             <button className="btn ghost" onClick={loadDemo}>
               载入 6 人示例
+            </button>
+          )}
+          <button
+            className="btn ghost"
+            onClick={() => fileInputRef.current?.click()}
+            title="从快照 JSON 文件导入：校验通过并确认后替换当前赛事"
+          >
+            导入快照
+          </button>
+          {(state.players.length > 0 || state.rounds.length > 0) && (
+            <button
+              className="btn ghost"
+              onClick={exportSnapshot}
+              title="导出包含选手、轮次、缺席快照与赛果的 JSON 文件"
+            >
+              导出快照
             </button>
           )}
           {(state.players.length > 0 || state.rounds.length > 0) && (
@@ -193,8 +260,17 @@ export default function App() {
         </div>
       </main>
 
+      {importData && (
+        <ImportSnapshotDialog
+          fileName={importData.fileName}
+          result={importData.result}
+          onCancel={() => setImportData(null)}
+          onConfirm={confirmImport}
+        />
+      )}
+
       <footer className="footer">
-        数据自动保存在本浏览器 localStorage 中，刷新不丢失；配对在浏览器本地完成。
+        数据自动保存在本浏览器 localStorage 中，刷新不丢失；配对在浏览器本地完成。可通过顶部「导出/导入快照」备份或迁移整届赛事。
       </footer>
     </div>
   );
