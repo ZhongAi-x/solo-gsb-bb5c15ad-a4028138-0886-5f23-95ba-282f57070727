@@ -1,12 +1,19 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react';
 import type { DraftPair, Match, TournamentState } from './types';
 import { computeStandings, type PairingPlan } from './engine';
 import { clearState, loadState, saveState } from './storage';
+import {
+  downloadSnapshot,
+  parseSnapshot,
+  type ImportIssue,
+  type SnapshotPreview,
+} from './snapshot';
 import { uid } from './uid';
 import { PlayersPanel } from './PlayersPanel';
 import { StandingsTable } from './StandingsTable';
 import { RoundsPanel } from './RoundsPanel';
 import { NextRoundPanel } from './NextRoundPanel';
+import { ImportErrorsModal, ImportPreviewModal } from './ImportModals';
 
 const DEMO_NAMES = ['阿尔法', '贝塔', '伽马', '德尔塔', '艾普西龙', '迪纳摩'];
 
@@ -17,6 +24,10 @@ export default function App() {
   const [manual, setManual] = useState<DraftPair[]>([]);
   // 下一轮工作区中勾选的本轮缺席选手（确认轮次时快照写入 Round.absentIds）
   const [absentIds, setAbsentIds] = useState<string[]>([]);
+  // 快照导入：文件选择器与校验结果（预览/错误均只展示，确认前不改写当前赛事）
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [importErrors, setImportErrors] = useState<ImportIssue[] | null>(null);
+  const [importPreview, setImportPreview] = useState<SnapshotPreview | null>(null);
 
   useEffect(() => {
     saveState(state);
@@ -114,6 +125,30 @@ export default function App() {
     setAbsentIds([]);
   };
 
+  /** 选择快照文件：仅做解析与全量校验，结果进入预览/错误模态，不改写当前赛事 */
+  const handleImportFile = async (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = ''; // 允许再次选择同一文件
+    if (!file) return;
+    const result = parseSnapshot(await file.text());
+    if (result.ok) {
+      setImportErrors(null);
+      setImportPreview(result.preview);
+    } else {
+      setImportPreview(null);
+      setImportErrors(result.errors);
+    }
+  };
+
+  /** 二次确认后：一次性替换赛事，并清空下一轮临时锁定与缺席选择 */
+  const confirmImport = () => {
+    if (!importPreview) return;
+    setState(importPreview.state);
+    setManual([]);
+    setAbsentIds([]);
+    setImportPreview(null);
+  };
+
   const loadDemo = () => {
     if (state.players.length > 0 && !window.confirm('载入示例将覆盖当前数据，确定？')) return;
     const players = DEMO_NAMES.map((name) => ({
@@ -155,6 +190,27 @@ export default function App() {
               载入 6 人示例
             </button>
           )}
+          <button
+            className="btn ghost"
+            onClick={() => downloadSnapshot(state)}
+            title="将选手、轮次、缺席快照与赛果导出为 JSON 文件"
+          >
+            导出快照
+          </button>
+          <button
+            className="btn ghost"
+            onClick={() => fileInputRef.current?.click()}
+            title="从 JSON 快照文件导入；校验通过并二次确认后替换当前赛事"
+          >
+            导入快照
+          </button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".json,application/json"
+            style={{ display: 'none' }}
+            onChange={handleImportFile}
+          />
           {(state.players.length > 0 || state.rounds.length > 0) && (
             <button className="btn danger ghost" onClick={resetAll}>
               清空重置
@@ -195,7 +251,19 @@ export default function App() {
 
       <footer className="footer">
         数据自动保存在本浏览器 localStorage 中，刷新不丢失；配对在浏览器本地完成。
+        可通过顶部「导出快照 / 导入快照」备份或迁移赛事。
       </footer>
+
+      {importErrors && (
+        <ImportErrorsModal errors={importErrors} onClose={() => setImportErrors(null)} />
+      )}
+      {importPreview && (
+        <ImportPreviewModal
+          preview={importPreview}
+          onCancel={() => setImportPreview(null)}
+          onConfirm={confirmImport}
+        />
+      )}
     </div>
   );
 }

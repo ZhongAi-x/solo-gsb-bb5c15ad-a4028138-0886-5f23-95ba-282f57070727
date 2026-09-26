@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "test:engine": "tsx scripts/selftest.ts"
+    "test:engine": "tsx scripts/selftest.ts",
+    "test:snapshot": "tsx scripts/selftest-snapshot.ts",
+    "test": "npm run test:engine && npm run test:snapshot"
   },
   "dependencies": {
     "react": "^18.3.1",

@@ -4,6 +4,7 @@
 录入选手（可选队伍）与各轮赛果/轮空后，一键生成下一轮对阵——在禁止重复交手前提下，
 按「同队对局数 → 跨积分组对局数 → 总积分差」全局最小化；支持锁定人工指定对局后重算，
 支持勾选本轮缺席选手（只配出席者），并在约束无解时列出冲突原因。
+顶部操作区可**导出 / 导入赛事快照**（带 `schemaVersion` 的 JSON），用于备份与迁移。
 
 ## 一条命令启动（Docker Compose）
 
@@ -50,6 +51,8 @@ npm run dev        # 开发服务器，访问 http://localhost:5173
 npm run build         # 类型检查 + 生产构建（输出到 dist/）
 npm run preview       # 本地预览生产构建（http://localhost:4173）
 npm run test:engine   # 运行配对引擎规则自测（共 24 个场景，含本轮缺席与旧数据迁移）
+npm run test:snapshot # 运行快照导入/导出校验自测（规范化、全量校验、错误路径）
+npm test              # 依次运行以上两组自测
 ```
 
 ## 选手与队伍字段格式
@@ -109,6 +112,43 @@ npm run test:engine   # 运行配对引擎规则自测（共 24 个场景，含�
 - 上一轮存在未录入赛果的对局时，工作区会给出醒目提示（仍可强制继续）。
 - 所有数据保存在浏览器 **localStorage**，刷新不丢失；“清空重置”可清除全部数据。
 
+## 赛事快照导入 / 导出
+
+顶部操作区提供「导出快照」「导入快照」两个按钮，用于备份、分享或换机迁移整届赛事。
+
+**导出**：生成带 `schemaVersion` 的 JSON 文件并下载（文件名形如
+`swiss-snapshot-2026-09-26T12-00-00.json`），内容包含：
+
+```jsonc
+{
+  "schemaVersion": 1,
+  "exportedAt": "2026-09-26T12:00:00.000Z",
+  "players": [{ "id": "p_…", "name": "张三", "team": "红队" }], // team 可选
+  "rounds": [
+    {
+      "id": "r_…",
+      "matches": [
+        // resultA：win / draw / loss / null（未录入）；轮空场 playerBId 为 null 且 resultA 为 win
+        { "id": "m_…", "playerAId": "p_…", "playerBId": "p_…", "resultA": "win", "bye": false }
+      ],
+      "absentIds": [] // 本轮缺席快照
+    }
+  ]
+}
+```
+
+**导入**：选择 JSON 文件后，先在内存中完成规范化与全量校验，**此阶段不改写当前赛事**：
+
+- *规范化（迁移）*：旧版缺少 `absentIds` 的轮次补为空缺席名单；空队伍名视为无队伍；
+  轮空场缺省补齐 `bye` 与 `resultA: "win"`；未标注 `schemaVersion` 的文件按当前版本兼容处理。
+- *全量校验*：选手 / 轮次 / 对局 ID 全局唯一；对局双方与缺席名单必须引用存在的选手；
+  同一轮内选手不重复（含轮空者）；轮空结构合法（`playerBId: null` ⇔ 轮空，且赛果必须为 `"win"`）；
+  赛果取值仅限 `"win" / "draw" / "loss" / null`；缺席名单不得与本轮对局冲突；选手不超过 32 人。
+- 存在任何错误：弹窗按 **JSON 路径**（如 `rounds[0].matches[2].playerAId`）逐条列出全部问题，
+  **整体拒绝导入，不会部分写入**。
+- 校验通过：仅展示选手 / 轮次 / 对局数量及问题预览（未录入赛果场数、迁移提示等）；
+  **二次确认后**才一次性替换当前赛事，并同时清空下一轮工作区的临时锁定与缺席勾选。
+
 ## 操作流程
 
 1. 在「选手名单」中单个或批量录入选手（最多 32 人；可用「姓名|队伍」格式填写可选队伍；
@@ -133,14 +173,17 @@ npm run test:engine   # 运行配对引擎规则自测（共 24 个场景，含�
 ├── package.json
 ├── vite.config.ts
 ├── scripts/
-│   └── selftest.ts           # 配对引擎规则自测
+│   ├── selftest.ts           # 配对引擎规则自测
+│   └── selftest-snapshot.ts  # 快照导入/导出校验自测
 └── src/
     ├── main.tsx              # React 入口
-    ├── App.tsx               # 状态管理与页面编排
+    ├── App.tsx               # 状态管理与页面编排（含快照导入/导出接线）
     ├── types.ts              # 数据模型（Player 含可选 team 字段；Round 含 absentIds 缺席快照）
     ├── engine.ts             # 瑞士制核心：积分、轮空、同队回避、缺席过滤、分支限界配对、冲突诊断
     ├── storage.ts            # localStorage 持久化（含旧数据迁移：缺席名单缺省视为空）
+    ├── snapshot.ts           # 快照导出构建与导入解析：规范化迁移 + 全量校验（错误按 JSON 路径报告）
     ├── uid.ts
+    ├── ImportModals.tsx      # 导入错误列表（JSON 路径）与导入预览二次确认模态
     ├── PlayersPanel.tsx      # 选手/队伍录入（≤32 人，支持批量与行内改队）
     ├── StandingsTable.tsx    # 积分榜（含队伍列）
     ├── NextRoundPanel.tsx    # 下一轮工作区：生成/锁定/同队标记/冲突展示/确认
